@@ -78,6 +78,29 @@ def main():
             [r["id"], r["name"], r["created_at"]],
         )
 
+    # users / league_members are new tables that may not exist in an older
+    # local DB yet — migrate them only if present, so this script still works
+    # against a pre-auth local database.
+    local_tables = {r["name"] for r in src.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()}
+
+    if "users" in local_tables:
+        print("Migrating users...")
+        for r in src.execute("SELECT * FROM users").fetchall():
+            turso.execute(
+                "INSERT INTO users (id, username, password_hash, salt, created_at) VALUES (?,?,?,?,?)",
+                [r["id"], r["username"], r["password_hash"], r["salt"], r["created_at"]],
+            )
+
+    if "league_members" in local_tables:
+        print("Migrating league memberships...")
+        for r in src.execute("SELECT * FROM league_members").fetchall():
+            turso.execute(
+                "INSERT INTO league_members (league_id, user_id, role) VALUES (?,?,?)",
+                [r["league_id"], r["user_id"], r["role"]],
+            )
+
     print("Migrating players...")
     for r in src.execute("SELECT * FROM players").fetchall():
         turso.execute(

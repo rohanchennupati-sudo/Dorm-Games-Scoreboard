@@ -176,6 +176,21 @@ CREATE TABLE IF NOT EXISTS elo (
     player_id INTEGER PRIMARY KEY REFERENCES players(id),
     rating REAL NOT NULL DEFAULT 1500
 );
+
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    salt TEXT NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS league_members (
+    league_id INTEGER REFERENCES leagues(id),
+    user_id INTEGER REFERENCES users(id),
+    role TEXT NOT NULL DEFAULT 'member',
+    PRIMARY KEY (league_id, user_id)
+);
 """
 
 
@@ -243,13 +258,29 @@ def seed_if_empty():
 # ---------------------------------------------------------------------------
 
 def get_leagues():
+    """All leagues, regardless of membership — used internally (e.g. by the
+    'claim orphaned leagues' bootstrap in auth.py). Not for display to users."""
     conn = get_connection()
     rows = conn.execute("SELECT * FROM leagues ORDER BY created_at").fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 
-def create_league(name: str):
+def get_leagues_for_user(user_id: int):
+    """Only leagues this user is a member of — this is what the UI should show."""
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT l.* FROM leagues l
+           JOIN league_members lm ON lm.league_id = l.id
+           WHERE lm.user_id = ?
+           ORDER BY l.created_at""",
+        (user_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def create_league(name: str, owner_user_id: int):
     name = name.strip()
     if not name:
         raise ValueError("League name can't be empty.")
@@ -261,9 +292,65 @@ def create_league(name: str):
         raise ValueError(f"A league called '{name}' already exists.")
     cur.execute("INSERT INTO leagues (name) VALUES (?)", (name,))
     league_id = cur.lastrowid
+    cur.execute(
+        "INSERT INTO league_members (league_id, user_id, role) VALUES (?,?,'owner')",
+        (league_id, owner_user_id),
+    )
     conn.commit()
     conn.close()
     return league_id
+
+
+def is_league_member(league_id: int, user_id: int) -> bool:
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT 1 FROM league_members WHERE league_id=? AND user_id=?", (league_id, user_id)
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def is_league_owner(league_id: int, user_id: int) -> bool:
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT 1 FROM league_members WHERE league_id=? AND user_id=? AND role='owner'",
+        (league_id, user_id),
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def get_league_members(league_id: int):
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT u.username, lm.role FROM league_members lm
+           JOIN users u ON u.id = lm.user_id
+           WHERE lm.league_id = ? ORDER BY lm.role, u.username""",
+        (league_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def add_league_member(league_id: int, username: str, role: str = "member"):
+    conn = get_connection()
+    cur = conn.cursor()
+    user = cur.execute("SELECT id FROM users WHERE username=?", (username.strip(),)).fetchone()
+    if not user:
+        conn.close()
+        raise ValueError(f"No user called '{username}' exists yet — they need to sign up first.")
+    existing = cur.execute(
+        "SELECT 1 FROM league_members WHERE league_id=? AND user_id=?", (league_id, user["id"])
+    ).fetchone()
+    if existing:
+        conn.close()
+        raise ValueError(f"'{username}' is already in this league.")
+    cur.execute(
+        "INSERT INTO league_members (league_id, user_id, role) VALUES (?,?,?)",
+        (league_id, user["id"], role),
+    )
+    conn.commit()
+    conn.close()
 
 
 # ---------------------------------------------------------------------------

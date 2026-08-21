@@ -2,43 +2,125 @@ import streamlit as st
 import pandas as pd
 from datetime import date
 import db
+import ml
+import auth
 
 st.set_page_config(page_title="Table Tennis Tracker", page_icon="🏓", layout="wide")
 
 db.init_db()
 db.seed_if_empty()
 
+
+# =============================================================================
+# AUTH GATE — nothing below this renders until someone is logged in.
+# =============================================================================
+
+def render_login_gate():
+    st.title("🏓 Table Tennis Tournament Tracker")
+    st.caption("Sign in to see your leagues, or create an account to start your own.")
+
+    tab_login, tab_signup = st.tabs(["Log in", "Sign up"])
+
+    with tab_login:
+        username = st.text_input("Username", key="login_username")
+        password = st.text_input("Password", type="password", key="login_password")
+        if st.button("Log in", type="primary"):
+            result = auth.verify_user(username, password)
+            if result:
+                st.session_state["user_id"], st.session_state["username"] = result
+                st.rerun()
+            else:
+                st.error("Wrong username or password.")
+
+    with tab_signup:
+        new_username = st.text_input("Choose a username", key="signup_username")
+        new_password = st.text_input("Choose a password", type="password", key="signup_password")
+        st.caption("Username: 3+ characters. Password: 6+ characters.")
+        if st.button("Create account"):
+            try:
+                user_id = auth.create_user(new_username, new_password)
+                st.session_state["user_id"], st.session_state["username"] = user_id, new_username.strip()
+                st.success("Account created!")
+                st.rerun()
+            except ValueError as e:
+                st.error(str(e))
+
+
+if "user_id" not in st.session_state:
+    render_login_gate()
+    st.stop()
+
+user_id = st.session_state["user_id"]
+username = st.session_state["username"]
+
+
+# =============================================================================
+# MAIN APP — only reachable once logged in.
+# =============================================================================
+
 st.title("🏓 Table Tennis Tournament Tracker")
 
-# ------------------------------------------------------------- LEAGUE PICKER
-leagues = db.get_leagues()
+leagues = db.get_leagues_for_user(user_id)
 league_names = [l["name"] for l in leagues]
 
 with st.sidebar:
+    st.write(f"Logged in as **{username}**")
+    if st.button("Log out"):
+        del st.session_state["user_id"]
+        del st.session_state["username"]
+        st.rerun()
+
+    st.divider()
     st.header("League")
-    selected_name = st.selectbox("Active league", options=league_names, key="league_select")
-    active_league = next(l for l in leagues if l["name"] == selected_name)
+
+    if league_names:
+        selected_name = st.selectbox("Active league", options=league_names, key="league_select")
+        active_league = next(l for l in leagues if l["name"] == selected_name)
+    else:
+        active_league = None
+        st.info("You're not in any league yet. Create one below.")
 
     with st.expander("➕ Create a new league"):
         new_league_name = st.text_input("League name", key="new_league_name")
         if st.button("Create league"):
             try:
-                db.create_league(new_league_name)
-                st.success(f"Created '{new_league_name}'. Select it above.")
+                db.create_league(new_league_name, owner_user_id=user_id)
+                st.success(f"Created '{new_league_name}'.")
                 st.rerun()
             except ValueError as e:
                 st.error(str(e))
 
-    with st.expander("➕ Add a player to this league"):
-        new_player_name = st.text_input("Player name", key="new_player_name")
-        new_player_nick = st.text_input("Nickname / team name (optional)", key="new_player_nick")
-        if st.button("Add player"):
-            try:
-                db.add_player(active_league["id"], new_player_name, new_player_nick)
-                st.success(f"Added '{new_player_name}' to {active_league['name']}.")
-                st.rerun()
-            except ValueError as e:
-                st.error(str(e))
+    if active_league:
+        with st.expander("➕ Add a player to this league"):
+            new_player_name = st.text_input("Player name", key="new_player_name")
+            new_player_nick = st.text_input("Nickname / team name (optional)", key="new_player_nick")
+            if st.button("Add player"):
+                try:
+                    db.add_player(active_league["id"], new_player_name, new_player_nick)
+                    st.success(f"Added '{new_player_name}' to {active_league['name']}.")
+                    st.rerun()
+                except ValueError as e:
+                    st.error(str(e))
+
+        is_owner = db.is_league_owner(active_league["id"], user_id)
+        with st.expander("👥 Members" + (" (owner)" if is_owner else "")):
+            members = db.get_league_members(active_league["id"])
+            for m in members:
+                st.write(f"- {m['username']} ({m['role']})")
+            if is_owner:
+                invite_username = st.text_input("Invite a registered username", key="invite_username")
+                if st.button("Add to league"):
+                    try:
+                        db.add_league_member(active_league["id"], invite_username)
+                        st.success(f"Added '{invite_username}'.")
+                        st.rerun()
+                    except ValueError as e:
+                        st.error(str(e))
+            else:
+                st.caption("Only the league owner can invite new members.")
+
+if not active_league:
+    st.stop()
 
 league_id = active_league["id"]
 st.caption(f"Viewing: **{active_league['name']}**")
@@ -50,8 +132,8 @@ if len(players) < 2:
     st.warning("This league needs at least 2 players before you can record a match. Add players from the sidebar.")
     st.stop()
 
-tab_entry, tab_standings, tab_h2h, tab_elo, tab_log = st.tabs(
-    ["➕ Enter Match", "📊 Standings", "🤝 Head-to-Head", "📈 Elo & Predictions", "📜 Match Log"]
+tab_entry, tab_standings, tab_h2h, tab_elo, tab_ml, tab_log = st.tabs(
+    ["➕ Enter Match", "📊 Standings", "🤝 Head-to-Head", "📈 Elo & Predictions", "🤖 ML Model", "📜 Match Log"]
 )
 
 # ---------------------------------------------------------------- ENTRY TAB
@@ -137,6 +219,54 @@ with tab_elo:
     prob_a, prob_b = db.win_probability(name_to_id[pred_a], name_to_id[pred_b])
     st.write(f"**{pred_a}: {prob_a*100:.1f}%** win probability  ·  **{pred_b}: {prob_b*100:.1f}%**")
     st.progress(prob_a)
+
+# -------------------------------------------------------------------- ML TAB
+with tab_ml:
+    st.subheader(f"Trained model — {active_league['name']}")
+    st.caption(
+        "A logistic regression trained on this league's own match history — separate from the "
+        "Elo formula above. Features: Elo gap, recent form (last 5 games), head-to-head win rate, "
+        "and recent point-margin gap, each computed using only data available *before* the match "
+        "being predicted (no lookahead)."
+    )
+
+    result = ml.train_and_evaluate(league_id)
+    if "error" in result:
+        st.info(result["error"] + " Keep logging matches — the model retrains automatically each time.")
+    else:
+        m = result["metrics"]
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Matches used", m["n_matches"])
+        c1.metric("Training samples", m["n_samples"], help="2× matches — each match also contributes a mirrored row (players swapped) so the model can't learn a spurious player-order bias.")
+        c2.metric("Training-set accuracy", f"{m['train_accuracy']*100:.1f}%", help="Fit on the same data it was trained on — optimistic, shown for reference only.")
+        if m.get("cv_accuracy") is not None:
+            c3.metric("Cross-validated accuracy", f"{m['cv_accuracy']*100:.1f}%", help=f"Time-series cross-validation across {m['cv_folds']} folds — each fold tests only on matches that happened after its training data, so no lookahead.")
+            if m.get("cv_log_loss") is not None:
+                c3.metric("Cross-validated log loss", f"{m['cv_log_loss']:.3f}", help="Lower is better. 0.693 is what a coin-flip model scores.")
+        else:
+            st.caption(m.get("note", ""))
+
+        st.write("**Learned feature weights** (positive = favors Player 1 when higher)")
+        coef_df = pd.DataFrame(
+            [{"Feature": k, "Weight": v} for k, v in m["coefficients"].items()]
+        ).sort_values("Weight", key=abs, ascending=False)
+        st.dataframe(coef_df, hide_index=True, use_container_width=True)
+
+        st.divider()
+        st.subheader("Model win predictor")
+        mc1, mc2 = st.columns(2)
+        with mc1:
+            ml_pred_a = st.selectbox("Player A", options=names, key="ml_pred_a")
+        with mc2:
+            ml_pred_b = st.selectbox("Player B", options=[n for n in names if n != ml_pred_a], key="ml_pred_b")
+        prob, err = ml.predict_with_model(league_id, name_to_id[ml_pred_a], name_to_id[ml_pred_b])
+        if err:
+            st.info(err)
+        else:
+            st.write(f"**{ml_pred_a}: {prob*100:.1f}%** win probability (model)  ·  **{ml_pred_b}: {(1-prob)*100:.1f}%**")
+            st.progress(prob)
+            elo_prob, _ = db.win_probability(name_to_id[ml_pred_a], name_to_id[ml_pred_b])
+            st.caption(f"For comparison, plain Elo gives {ml_pred_a} a {elo_prob*100:.1f}% chance.")
 
 # ------------------------------------------------------------------ LOG TAB
 with tab_log:

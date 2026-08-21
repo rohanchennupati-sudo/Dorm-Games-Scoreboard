@@ -26,19 +26,89 @@ can:
 Everything (`standings`, `H2H`, `Elo`, `match log`) is always scoped to
 whichever league is selected at the top of the sidebar.
 
+## The trained model (not just Elo)
+
+Elo (in `db.py`) is a hand-written update rule — useful, but not a learned
+model. `ml.py` adds a real supervised learning pipeline on top of the same
+match data:
+
+- **Features**, computed using only information available *before* each
+  match (no lookahead): Elo gap, each player's win rate over their last 5
+  games, their head-to-head win rate against this specific opponent so far,
+  and their recent average point margin. Every match also contributes a
+  mirrored row (players swapped, features negated, label flipped) so the
+  model can't learn a spurious "player 1 wins more" bias from column order.
+- **Model**: logistic regression (`scikit-learn`), retrained on the fly from
+  current match data each time it's used — the dataset is small enough that
+  this is cheap, and it means the model is always up to date.
+- **Evaluation**: with 10+ matches, uses `TimeSeriesSplit` cross-validation
+  — each fold is only tested on matches that happened *after* its training
+  data, so the reported accuracy/log-loss can't be inflated by leakage. With
+  fewer than 10 matches, the app says so explicitly and shows training-set
+  fit only, rather than presenting an unreliable number with false
+  confidence.
+- **Minimum data**: needs 6+ matches logged in a league before it will train
+  at all; below that, `ml.py` returns a clear error instead of a garbage
+  prediction.
+
+Like the Elo backfill decision, this only trains on matches entered through
+this app (the `matches` table) — the legacy 60-game baseline is
+aggregate-only, so there's no per-game data to learn from there.
+
+## Accounts & access control
+
+The app is gated behind sign-up/login (username + password, salted and
+hashed with PBKDF2-HMAC-SHA256 — no external auth service, just Python's
+stdlib). This is what stops a random person with the URL from creating fake
+matches in your league:
+
+- **Leagues are private by default.** The league picker only ever shows
+  leagues you're a member of. Someone else's league simply doesn't appear
+  in your list — there's no way to select or edit it.
+- **Anyone can sign up and create their own league(s)**, which they own.
+- **Owners invite members by username** (sidebar → Members), so a league
+  can be shared with specific people without opening it to everyone.
+- **Bootstrapping your existing data:** since your original league(s) were
+  created before accounts existed, they start with zero members. The very
+  first account created on a given database automatically becomes owner of
+  every such "orphaned" league. **Sign up as yourself before sharing the
+  app with anyone else** — otherwise someone else's signup could claim your
+  data instead.
+
+If you already deployed before this update, see "Upgrading an existing
+deployment" below for the one extra step needed.
+
+## Upgrading an existing deployment
+
+- **Local database, pre multi-league** (the very first version you ran):
+  run `python upgrade_local_schema.py` once.
+- **Local or Turso database, multi-league but pre-auth** (anything from
+  before this update): nothing extra needed for local — just run the app,
+  since `db.init_db()` adds the new `users`/`league_members` tables
+  automatically (they use `CREATE TABLE IF NOT EXISTS`, so nothing existing
+  is touched). For an **already-migrated Turso database**, run
+  `python add_auth_tables_to_turso.py` once instead.
+- Either way, **sign up as yourself first** so you automatically become
+  owner of your existing league(s) — see above.
+
 ## Architecture
 
 ```
 tt-tracker/
-├── app.py          # Streamlit UI (5 tabs: Entry, Standings, H2H, Elo, Log)
-├── db.py           # SQLite schema + all stats/Elo logic (no UI code here)
+├── app.py          # Streamlit UI: login gate + 6 tabs (Entry, Standings, H2H, Elo, ML Model, Log)
+├── auth.py         # Account creation, login verification, legacy-league claiming
+├── db.py           # SQLite/Turso schema + all stats/Elo/league/membership logic
+├── ml.py           # Feature engineering + trained logistic regression model
 ├── data/
 │   └── tt_tracker.db
 └── requirements.txt
 ```
 
 **Data model**
+- `users` — one row per account (username + salted/hashed password).
 - `leagues` — one row per league/tournament; everything below belongs to one.
+- `league_members` — who can see/edit which league, and whether they're the
+  owner (can invite others) or a regular member.
 - `players` — scoped to a league (name unique within a league, not globally).
 - `baseline` / `baseline_h2h` — the legacy 60-game season totals from the
   original spreadsheet, frozen as a starting point for the original league.
@@ -126,12 +196,18 @@ moment it finds Turso credentials — no code changes needed, just secrets.
 
 ## Possible extensions (good "future work" bullet points)
 
-- **Score-margin regression**: predict expected final score margin, not just
-  win probability, using each player's recent point-differential trend.
-- **Form-weighted Elo**: exponentially weight recent matches more heavily so
-  a hot streak or slump shows up faster.
-- **Series-level analytics**: use the `series_id` field to chart
-  round-robin-over-round-robin momentum instead of only cumulative totals.
+- **Password reset** — currently there's no recovery flow if someone forgets
+  their password; would need an email-based reset or an admin override.
+- **Per-action permissions** — right now any league member can add matches
+  or players; only inviting new members is owner-restricted. Could add a
+  read-only "viewer" role for people who just want to watch standings.
+- **Richer features for the trained model**: rest days between matches,
+  opponent-strength-adjusted form, series-level momentum.
+- **Try other model families**: gradient boosting (XGBoost/LightGBM) often
+  handles small tabular datasets with non-linear interactions better than
+  logistic regression — worth comparing once there's more match data.
+- **Score-margin regression**: predict expected point margin, not just
+  win/loss, using the same feature set.
 - **Auth + Google Form front end**: swap the Streamlit form for a Google
   Form + Apps Script webhook into this same DB, so matches can be logged from
   a phone without opening the app.
