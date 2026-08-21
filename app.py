@@ -9,13 +9,46 @@ db.init_db()
 db.seed_if_empty()
 
 st.title("🏓 Table Tennis Tournament Tracker")
-st.caption(
-    "4-player league · standings carry forward from the original 60-game season, "
-    "Elo tracking begins from today's first new match."
-)
 
-players = db.get_players()
+# ------------------------------------------------------------- LEAGUE PICKER
+leagues = db.get_leagues()
+league_names = [l["name"] for l in leagues]
+
+with st.sidebar:
+    st.header("League")
+    selected_name = st.selectbox("Active league", options=league_names, key="league_select")
+    active_league = next(l for l in leagues if l["name"] == selected_name)
+
+    with st.expander("➕ Create a new league"):
+        new_league_name = st.text_input("League name", key="new_league_name")
+        if st.button("Create league"):
+            try:
+                db.create_league(new_league_name)
+                st.success(f"Created '{new_league_name}'. Select it above.")
+                st.rerun()
+            except ValueError as e:
+                st.error(str(e))
+
+    with st.expander("➕ Add a player to this league"):
+        new_player_name = st.text_input("Player name", key="new_player_name")
+        new_player_nick = st.text_input("Nickname / team name (optional)", key="new_player_nick")
+        if st.button("Add player"):
+            try:
+                db.add_player(active_league["id"], new_player_name, new_player_nick)
+                st.success(f"Added '{new_player_name}' to {active_league['name']}.")
+                st.rerun()
+            except ValueError as e:
+                st.error(str(e))
+
+league_id = active_league["id"]
+st.caption(f"Viewing: **{active_league['name']}**")
+
+players = db.get_players(league_id)
 name_to_id = {p["name"]: p["id"] for p in players}
+
+if len(players) < 2:
+    st.warning("This league needs at least 2 players before you can record a match. Add players from the sidebar.")
+    st.stop()
 
 tab_entry, tab_standings, tab_h2h, tab_elo, tab_log = st.tabs(
     ["➕ Enter Match", "📊 Standings", "🤝 Head-to-Head", "📈 Elo & Predictions", "📜 Match Log"]
@@ -41,6 +74,7 @@ with tab_entry:
     if st.button("Save match", type="primary"):
         try:
             result = db.record_match(
+                league_id=league_id,
                 match_date=str(match_date),
                 player1_id=name_to_id[p1_name],
                 player2_id=name_to_id[p2_name],
@@ -56,8 +90,8 @@ with tab_entry:
 
 # ------------------------------------------------------------ STANDINGS TAB
 with tab_standings:
-    st.subheader("Current standings")
-    standings = db.get_standings()
+    st.subheader(f"Current standings — {active_league['name']}")
+    standings = db.get_standings(league_id)
     df = pd.DataFrame(standings)[["name", "nickname", "mp", "w", "l", "gf", "ga", "gd", "points", "elo"]]
     df.columns = ["Player", "Team", "MP", "W", "L", "GF", "GA", "GD", "Points", "Elo"]
     df.insert(0, "Rank", range(1, len(df) + 1))
@@ -73,10 +107,10 @@ with tab_standings:
 
 # ------------------------------------------------------------------ H2H TAB
 with tab_h2h:
-    st.subheader("Head-to-head record")
-    h2h = db.get_h2h_matrix()
+    st.subheader(f"Head-to-head record — {active_league['name']}")
+    h2h = db.get_h2h_matrix(league_id)
     names = sorted(name_to_id.keys())
-    matrix = pd.DataFrame("—", index=names, columns=names)
+    matrix = pd.DataFrame("—", index=names, columns=names, dtype=object)
     for (a, b), wins in h2h.items():
         matrix.loc[a, b] = wins[a]
         matrix.loc[b, a] = wins[b]
@@ -85,9 +119,9 @@ with tab_h2h:
 
 # -------------------------------------------------------- ELO / PREDICT TAB
 with tab_elo:
-    st.subheader("Elo ratings")
-    st.caption("All players start at 1500 the day tracking began; ratings move ±up to 32 pts per game based on expected vs actual result.")
-    standings = db.get_standings()
+    st.subheader(f"Elo ratings — {active_league['name']}")
+    st.caption("Every player starts at 1500 when added to a league; ratings move ±up to 32 pts per game based on expected vs actual result.")
+    standings = db.get_standings(league_id)
     elo_df = pd.DataFrame(standings)[["name", "elo"]].sort_values("elo", ascending=False)
     elo_df.columns = ["Player", "Elo"]
     st.dataframe(elo_df, hide_index=True, use_container_width=True)
@@ -106,11 +140,21 @@ with tab_elo:
 
 # ------------------------------------------------------------------ LOG TAB
 with tab_log:
-    st.subheader("Match log (new matches only — legacy history was aggregate-only)")
-    log = db.get_match_log()
+    st.subheader(f"Match log — {active_league['name']}")
+    log = db.get_match_log(league_id)
     if not log:
         st.info("No matches recorded yet. Add one in the Enter Match tab.")
     else:
-        log_df = pd.DataFrame(log)[["match_date", "series_id", "p1_name", "score1", "score2", "p2_name"]]
-        log_df.columns = ["Date", "Series", "Player 1", "Score", "Score ", "Player 2"]
-        st.dataframe(log_df, hide_index=True, use_container_width=True)
+        for m in log:
+            c1, c2 = st.columns([5, 1])
+            with c1:
+                st.write(
+                    f"**{m['match_date']}** — {m['p1_name']} {m['score1']}-{m['score2']} {m['p2_name']}"
+                    + (f"  ·  series {m['series_id']}" if m["series_id"] else "")
+                )
+            with c2:
+                if st.button("🗑️ Delete", key=f"del_{m['id']}"):
+                    db.delete_match(m["id"])
+                    st.success("Deleted and Elo recalculated.")
+                    st.rerun()
+            st.divider()

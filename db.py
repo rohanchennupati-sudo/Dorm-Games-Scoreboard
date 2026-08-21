@@ -1,26 +1,30 @@
 """
-db.py — SQLite data layer for the Table Tennis Tracker.
+db.py — SQLite/Turso data layer for the Table Tennis Tracker.
 
 Design:
-- `players`      : the 4 (or more) players.
-- `baseline`      : legacy season totals from the old Excel sheet, frozen as a
-                    starting point (MP/W/L/GF/GA). New matches are added on
-                    top of this, never mutate it.
+- `leagues`       : one row per league/tournament. Everything else belongs
+                    to a league.
+- `players`       : players, scoped to a league (a name is unique within a
+                    league, not globally).
+- `baseline`      : legacy season totals frozen as a starting point per
+                    player. New matches are added on top of this, never
+                    mutate it. New leagues/players start at all zeros.
 - `baseline_h2h`  : legacy head-to-head win counts per pair, same idea.
-- `matches`       : every individual game entered from now on (source of truth
-                    going forward). One row = one game between two players.
-- `elo`           : current Elo rating per player. Starts at 1500 for
-                    everyone the day tracking began (we cannot honestly
-                    reconstruct Elo history from aggregate legacy totals).
+- `matches`       : every individual game entered (source of truth going
+                    forward). One row = one game between two players in a
+                    league.
+- `elo`           : current Elo rating per player. Starts at 1500 the day a
+                    player is added.
 
 All "current" stats (standings, H2H, Elo) are computed as
 baseline + aggregation-over-matches, so the DB never stores a stale derived
-number — it's always recomputed from raw match rows.
+number — it's always recomputed from raw match rows, scoped to whichever
+league is asked for.
 """
 
 import sqlite3
+import os
 from pathlib import Path
-from datetime import date
 
 DB_PATH = Path(__file__).parent / "data" / "tt_tracker.db"
 DB_PATH.parent.mkdir(exist_ok=True)
@@ -29,71 +33,170 @@ STARTING_ELO = 1500
 K_FACTOR = 32
 
 
+# ---------------------------------------------------------------------------
+# Turso (hosted libSQL) support. If TURSO_DATABASE_URL / TURSO_AUTH_TOKEN are
+# available (via Streamlit secrets or environment variables), every
+# get_connection() call returns a lightweight wrapper around a shared Turso
+# client that mimics the sqlite3 connection/cursor API used throughout this
+# file. Otherwise we fall back to the local SQLite file, unchanged.
+# ---------------------------------------------------------------------------
+
+_turso_client = None
+
+
+def _get_turso_creds():
+    try:
+        import streamlit as st
+        if "TURSO_DATABASE_URL" in st.secrets and "TURSO_AUTH_TOKEN" in st.secrets:
+            return st.secrets["TURSO_DATABASE_URL"], st.secrets["TURSO_AUTH_TOKEN"]
+    except Exception:
+        pass
+    url = os.environ.get("TURSO_DATABASE_URL")
+    token = os.environ.get("TURSO_AUTH_TOKEN")
+    if url and token:
+        return url, token
+    return None, None
+
+
+def _get_turso_client(url, token):
+    global _turso_client
+    if _turso_client is None:
+        import libsql_client
+        _turso_client = libsql_client.create_client_sync(url=url, auth_token=token)
+    return _turso_client
+
+
+class _TursoCursor:
+    """Mimics enough of sqlite3.Cursor for this file's needs."""
+
+    def __init__(self, client):
+        self._client = client
+        self.lastrowid = None
+        self._rows = []
+
+    def execute(self, sql, params=()):
+        result = self._client.execute(sql, list(params) if params else [])
+        self.lastrowid = result.last_insert_rowid
+        self._rows = [row.asdict() for row in result.rows]
+        return self
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+    def fetchall(self):
+        return self._rows
+
+
+class _TursoConnection:
+    """Mimics enough of sqlite3.Connection for this file's needs."""
+
+    def __init__(self, client):
+        self._client = client
+
+    def execute(self, sql, params=()):
+        return _TursoCursor(self._client).execute(sql, params)
+
+    def executescript(self, script):
+        for stmt in script.split(";"):
+            stmt = stmt.strip()
+            if stmt:
+                self._client.execute(stmt)
+
+    def cursor(self):
+        return _TursoCursor(self._client)
+
+    def commit(self):
+        pass  # Turso commits each statement immediately over HTTP
+
+    def close(self):
+        pass  # underlying client is a shared singleton — don't tear it down
+
+
 def get_connection():
+    url, token = _get_turso_creds()
+    if url and token:
+        return _TursoConnection(_get_turso_client(url, token))
+
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
+# ---------------------------------------------------------------------------
+# Schema + seeding
+# ---------------------------------------------------------------------------
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS leagues (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS players (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    league_id INTEGER NOT NULL REFERENCES leagues(id),
+    name TEXT NOT NULL,
+    nickname TEXT,
+    UNIQUE(league_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS baseline (
+    player_id INTEGER PRIMARY KEY REFERENCES players(id),
+    mp INTEGER NOT NULL DEFAULT 0,
+    w INTEGER NOT NULL DEFAULT 0,
+    l INTEGER NOT NULL DEFAULT 0,
+    gf INTEGER NOT NULL DEFAULT 0,
+    ga INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS baseline_h2h (
+    player1_id INTEGER REFERENCES players(id),
+    player2_id INTEGER REFERENCES players(id),
+    player1_wins INTEGER NOT NULL DEFAULT 0,
+    player2_wins INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (player1_id, player2_id)
+);
+
+CREATE TABLE IF NOT EXISTS matches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    league_id INTEGER NOT NULL REFERENCES leagues(id),
+    match_date TEXT NOT NULL,
+    series_id INTEGER,
+    player1_id INTEGER NOT NULL REFERENCES players(id),
+    player2_id INTEGER NOT NULL REFERENCES players(id),
+    score1 INTEGER NOT NULL,
+    score2 INTEGER NOT NULL,
+    winner_id INTEGER NOT NULL REFERENCES players(id),
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS elo (
+    player_id INTEGER PRIMARY KEY REFERENCES players(id),
+    rating REAL NOT NULL DEFAULT 1500
+);
+"""
+
+
 def init_db():
     conn = get_connection()
-    cur = conn.cursor()
-    cur.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS players (
-            id INTEGER PRIMARY KEY,
-            name TEXT UNIQUE NOT NULL,
-            nickname TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS baseline (
-            player_id INTEGER PRIMARY KEY REFERENCES players(id),
-            mp INTEGER NOT NULL DEFAULT 0,
-            w INTEGER NOT NULL DEFAULT 0,
-            l INTEGER NOT NULL DEFAULT 0,
-            gf INTEGER NOT NULL DEFAULT 0,
-            ga INTEGER NOT NULL DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS baseline_h2h (
-            player1_id INTEGER REFERENCES players(id),
-            player2_id INTEGER REFERENCES players(id),
-            player1_wins INTEGER NOT NULL DEFAULT 0,
-            player2_wins INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (player1_id, player2_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS matches (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            match_date TEXT NOT NULL,
-            series_id INTEGER,
-            player1_id INTEGER NOT NULL REFERENCES players(id),
-            player2_id INTEGER NOT NULL REFERENCES players(id),
-            score1 INTEGER NOT NULL,
-            score2 INTEGER NOT NULL,
-            winner_id INTEGER NOT NULL REFERENCES players(id),
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS elo (
-            player_id INTEGER PRIMARY KEY REFERENCES players(id),
-            rating REAL NOT NULL DEFAULT 1500
-        );
-        """
-    )
+    conn.executescript(SCHEMA)
     conn.commit()
     conn.close()
 
 
 def seed_if_empty():
-    """Seed players + legacy baseline (from the original Excel) exactly once."""
+    """Seed the original league + its 4 players + legacy baseline, exactly once."""
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) AS c FROM players")
+    cur.execute("SELECT COUNT(*) AS c FROM leagues")
     if cur.fetchone()["c"] > 0:
         conn.close()
         return
+
+    cur.execute("INSERT INTO leagues (name) VALUES (?)", ("Original Squad",))
+    league_id = cur.lastrowid
 
     # name -> (nickname, mp, w, l, gf, ga), decoded from the original sheet
     players = {
@@ -104,7 +207,10 @@ def seed_if_empty():
     }
     ids = {}
     for name, (nick, mp, w, l, gf, ga) in players.items():
-        cur.execute("INSERT INTO players (name, nickname) VALUES (?, ?)", (name, nick))
+        cur.execute(
+            "INSERT INTO players (league_id, name, nickname) VALUES (?, ?, ?)",
+            (league_id, name, nick),
+        )
         pid = cur.lastrowid
         ids[name] = pid
         cur.execute(
@@ -132,18 +238,80 @@ def seed_if_empty():
     conn.close()
 
 
-def get_players():
+# ---------------------------------------------------------------------------
+# Leagues
+# ---------------------------------------------------------------------------
+
+def get_leagues():
     conn = get_connection()
-    rows = conn.execute("SELECT * FROM players ORDER BY name").fetchall()
+    rows = conn.execute("SELECT * FROM leagues ORDER BY created_at").fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
+
+def create_league(name: str):
+    name = name.strip()
+    if not name:
+        raise ValueError("League name can't be empty.")
+    conn = get_connection()
+    cur = conn.cursor()
+    existing = cur.execute("SELECT id FROM leagues WHERE name=?", (name,)).fetchone()
+    if existing:
+        conn.close()
+        raise ValueError(f"A league called '{name}' already exists.")
+    cur.execute("INSERT INTO leagues (name) VALUES (?)", (name,))
+    league_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return league_id
+
+
+# ---------------------------------------------------------------------------
+# Players
+# ---------------------------------------------------------------------------
+
+def get_players(league_id: int):
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM players WHERE league_id=? ORDER BY name", (league_id,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def add_player(league_id: int, name: str, nickname: str = ""):
+    name = name.strip()
+    if not name:
+        raise ValueError("Player name can't be empty.")
+    conn = get_connection()
+    cur = conn.cursor()
+    existing = cur.execute(
+        "SELECT id FROM players WHERE league_id=? AND name=?", (league_id, name)
+    ).fetchone()
+    if existing:
+        conn.close()
+        raise ValueError(f"'{name}' is already a player in this league.")
+    cur.execute(
+        "INSERT INTO players (league_id, name, nickname) VALUES (?,?,?)",
+        (league_id, name, nickname.strip() or None),
+    )
+    pid = cur.lastrowid
+    cur.execute("INSERT INTO baseline (player_id, mp, w, l, gf, ga) VALUES (?,0,0,0,0,0)", (pid,))
+    cur.execute("INSERT INTO elo (player_id, rating) VALUES (?, ?)", (pid, STARTING_ELO))
+    conn.commit()
+    conn.close()
+    return pid
+
+
+# ---------------------------------------------------------------------------
+# Matches
+# ---------------------------------------------------------------------------
 
 def _pair_key(p1, p2):
     return (p1, p2) if p1 < p2 else (p2, p1)
 
 
-def record_match(match_date: str, player1_id: int, player2_id: int,
+def record_match(league_id: int, match_date: str, player1_id: int, player2_id: int,
                   score1: int, score2: int, series_id=None):
     if player1_id == player2_id:
         raise ValueError("A player cannot play themselves.")
@@ -154,9 +322,9 @@ def record_match(match_date: str, player1_id: int, player2_id: int,
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        """INSERT INTO matches (match_date, series_id, player1_id, player2_id, score1, score2, winner_id)
-           VALUES (?,?,?,?,?,?,?)""",
-        (match_date, series_id, player1_id, player2_id, score1, score2, winner_id),
+        """INSERT INTO matches (league_id, match_date, series_id, player1_id, player2_id, score1, score2, winner_id)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (league_id, match_date, series_id, player1_id, player2_id, score1, score2, winner_id),
     )
 
     # --- Elo update ---
@@ -176,18 +344,68 @@ def record_match(match_date: str, player1_id: int, player2_id: int,
     return {"winner_id": winner_id, "new_elo": {player1_id: new_r1, player2_id: new_r2}}
 
 
-def get_standings():
-    """Baseline + all matches, combined into current MP/W/L/GF/GA/GD/Points."""
+def recompute_elo(league_id: int):
+    """Replay every remaining match in a league, in chronological order, and
+    rebuild Elo from STARTING_ELO. Call after deleting/editing any match."""
     conn = get_connection()
-    players = conn.execute("SELECT * FROM players").fetchall()
-    baseline = {r["player_id"]: dict(r) for r in conn.execute("SELECT * FROM baseline").fetchall()}
-    elo_rows = {r["player_id"]: r["rating"] for r in conn.execute("SELECT * FROM elo").fetchall()}
-    matches = conn.execute("SELECT * FROM matches").fetchall()
+    cur = conn.cursor()
+    player_ids = [r["id"] for r in cur.execute(
+        "SELECT id FROM players WHERE league_id=?", (league_id,)
+    ).fetchall()]
+    ratings = {pid: STARTING_ELO for pid in player_ids}
+
+    matches = cur.execute(
+        "SELECT * FROM matches WHERE league_id=? ORDER BY match_date ASC, id ASC", (league_id,)
+    ).fetchall()
+    for m in matches:
+        p1, p2, winner = m["player1_id"], m["player2_id"], m["winner_id"]
+        r1, r2 = ratings[p1], ratings[p2]
+        exp1 = 1 / (1 + 10 ** ((r2 - r1) / 400))
+        exp2 = 1 - exp1
+        actual1 = 1.0 if winner == p1 else 0.0
+        actual2 = 1.0 - actual1
+        ratings[p1] = r1 + K_FACTOR * (actual1 - exp1)
+        ratings[p2] = r2 + K_FACTOR * (actual2 - exp2)
+
+    for pid, rating in ratings.items():
+        cur.execute("UPDATE elo SET rating=? WHERE player_id=?", (rating, pid))
+    conn.commit()
+    conn.close()
+
+
+def delete_match(match_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    row = cur.execute("SELECT league_id FROM matches WHERE id=?", (match_id,)).fetchone()
+    if not row:
+        conn.close()
+        return
+    league_id = row["league_id"]
+    cur.execute("DELETE FROM matches WHERE id=?", (match_id,))
+    conn.commit()
+    conn.close()
+    recompute_elo(league_id)
+
+
+# ---------------------------------------------------------------------------
+# Derived stats
+# ---------------------------------------------------------------------------
+
+def get_standings(league_id: int):
+    """Baseline + all matches in this league, combined into current stats."""
+    conn = get_connection()
+    players = conn.execute("SELECT * FROM players WHERE league_id=?", (league_id,)).fetchall()
+    player_ids = [p["id"] for p in players]
+    baseline = {r["player_id"]: dict(r) for r in conn.execute("SELECT * FROM baseline").fetchall()
+                if r["player_id"] in player_ids}
+    elo_rows = {r["player_id"]: r["rating"] for r in conn.execute("SELECT * FROM elo").fetchall()
+                if r["player_id"] in player_ids}
+    matches = conn.execute("SELECT * FROM matches WHERE league_id=?", (league_id,)).fetchall()
     conn.close()
 
     stats = {}
     for p in players:
-        b = baseline[p["id"]]
+        b = baseline.get(p["id"], {"mp": 0, "w": 0, "l": 0, "gf": 0, "ga": 0})
         stats[p["id"]] = {
             "id": p["id"], "name": p["name"], "nickname": p["nickname"],
             "mp": b["mp"], "w": b["w"], "l": b["l"], "gf": b["gf"], "ga": b["ga"],
@@ -218,18 +436,22 @@ def get_standings():
     return result
 
 
-def get_h2h_matrix():
-    """Returns {(name1, name2): {name1: wins, name2: wins}} combining baseline + matches."""
+def get_h2h_matrix(league_id: int):
+    """Returns {(name1, name2): {name1: wins, name2: wins}} for this league."""
     conn = get_connection()
-    players = {r["id"]: r["name"] for r in conn.execute("SELECT * FROM players").fetchall()}
-    baseline_h2h = conn.execute("SELECT * FROM baseline_h2h").fetchall()
-    matches = conn.execute("SELECT * FROM matches").fetchall()
+    players = {r["id"]: r["name"] for r in conn.execute(
+        "SELECT * FROM players WHERE league_id=?", (league_id,)
+    ).fetchall()}
+    player_ids = set(players.keys())
+    baseline_h2h = [r for r in conn.execute("SELECT * FROM baseline_h2h").fetchall()
+                     if r["player1_id"] in player_ids and r["player2_id"] in player_ids]
+    matches = conn.execute("SELECT * FROM matches WHERE league_id=?", (league_id,)).fetchall()
     conn.close()
 
-    pair_wins = {}  # (pid_a, pid_b) sorted -> {pid: wins}
+    pair_wins = {}
     for row in baseline_h2h:
         key = _pair_key(row["player1_id"], row["player2_id"])
-        pair_wins.setdefault(key, {}).setdefault(row["player1_id"], 0)
+        pair_wins.setdefault(key, {})
         pair_wins[key][row["player1_id"]] = pair_wins[key].get(row["player1_id"], 0) + row["player1_wins"]
         pair_wins[key][row["player2_id"]] = pair_wins[key].get(row["player2_id"], 0) + row["player2_wins"]
 
@@ -246,15 +468,16 @@ def get_h2h_matrix():
     return named
 
 
-def get_match_log(limit=200):
+def get_match_log(league_id: int, limit=200):
     conn = get_connection()
     rows = conn.execute(
         """SELECT m.*, p1.name AS p1_name, p2.name AS p2_name
            FROM matches m
            JOIN players p1 ON p1.id = m.player1_id
            JOIN players p2 ON p2.id = m.player2_id
+           WHERE m.league_id=?
            ORDER BY m.match_date DESC, m.id DESC LIMIT ?""",
-        (limit,),
+        (league_id, limit),
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
