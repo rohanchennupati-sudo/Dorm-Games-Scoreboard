@@ -1,39 +1,34 @@
 """
-ml.py — a real trained win-probability model, separate from the Elo formula
-in db.py.
+ml.py — a trained win-probability model, separate from the Elo formula in db.py.
 
-Why this exists: Elo is a hand-written update rule, not a learned model.
-This module builds an actual supervised learning pipeline on top of the
-same match data:
+Elo is a fixed update rule; this module learns from the match history:
 
-1. FEATURE ENGINEERING (_build_dataset): walks through a league's matches
-   in chronological order, and for each match computes four features using
-   ONLY information available *before* that match was played (no leakage):
+1. FEATURES (_build_dataset): replay a league's matches in date order and,
+   for each match, compute four features from the state BEFORE that match
+   (no lookahead):
      - elo_diff:    Elo rating gap between the two players at that point
-     - form_diff:   difference in each player's win rate over their last
-                     FORM_WINDOW games
-     - h2h_diff:    each player's head-to-head win rate against this
-                     specific opponent, up to that point
-     - margin_diff: difference in each player's average recent point margin
-   The match's actual result becomes the label. Each match also contributes
-   a mirrored row (players swapped, features negated, label flipped) so the
-   model can't pick up a spurious "player 1 wins more" bias from column
-   ordering.
+     - form_diff:   difference in win rate over each player's last FORM_WINDOW games
+     - h2h_diff:    player 1's share of their previous head-to-head wins, minus 0.5
+     - margin_diff: difference in average point margin over the last FORM_WINDOW games
+   The label is 1 if player 1 won.
 
-2. TRAINING + EVALUATION (train_and_evaluate): fits a logistic regression on
-   this data. With enough matches, it evaluates using TimeSeriesSplit
-   cross-validation (never testing on a fold using data from the future,
-   which a plain random split would allow) and reports accuracy + log loss.
-   With too few matches for a trustworthy held-out test, it says so plainly
-   instead of reporting a misleadingly confident number.
+2. MIRRORING (_mirror): every match is also added with the players swapped
+   (features negated, label flipped), so the model can't learn a "player 1
+   usually wins" bias from the order players were entered.
 
-3. LIVE PREDICTION (predict_with_model): reuses the same feature pipeline
-   on the CURRENT state of the league (after all matches) to predict a
-   hypothetical next match between two players.
+3. TRAINING + EVALUATION (train_and_evaluate): StandardScaler + logistic
+   regression. Scaling puts the features on the same scale, so the learned
+   weights can be compared and regularisation treats them equally. With
+   enough matches it reports TimeSeriesSplit cross-validation (always tested
+   on later matches than it trained on). Folds are split by match and
+   mirrored inside each training fold, so a match and its mirror can never
+   end up on opposite sides of a split.
 
-Note: only matches logged through this app (the `matches` table) have
-per-game data to learn from — the legacy 60-game baseline is aggregate-only,
-so it's correctly excluded here, same reasoning as the Elo backfill.
+4. PREDICTION (predict_with_model): the same features computed from the
+   current state, for a hypothetical next match.
+
+Only matches logged in the app (the `matches` table) are used; the legacy
+baseline has season totals but no per-game data.
 """
 
 import numpy as np
@@ -45,6 +40,8 @@ MIN_MATCHES_FOR_CV = 10
 
 try:
     from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
     from sklearn.model_selection import TimeSeriesSplit
     from sklearn.metrics import accuracy_score, log_loss
     SKLEARN_AVAILABLE = True
@@ -97,11 +94,8 @@ def _apply_result(state, p1, p2, winner_id, score1, score2):
         state["recent_results"].setdefault(pid, [])
         state["recent_margins"].setdefault(pid, [])
 
-    r1, r2 = state["elo"][p1], state["elo"][p2]
-    exp1 = 1 / (1 + 10 ** ((r2 - r1) / 400))
-    actual1 = 1.0 if winner_id == p1 else 0.0
-    state["elo"][p1] = r1 + db.K_FACTOR * (actual1 - exp1)
-    state["elo"][p2] = r2 + db.K_FACTOR * ((1 - actual1) - (1 - exp1))
+    state["elo"][p1], state["elo"][p2] = db._elo_step(
+        state["elo"][p1], state["elo"][p2], winner_id == p1)
 
     state["recent_results"][p1].append(1 if winner_id == p1 else 0)
     state["recent_results"][p2].append(1 if winner_id == p2 else 0)
@@ -114,7 +108,7 @@ def _apply_result(state, p1, p2, winner_id, score1, score2):
 
 
 def _build_dataset(league_id):
-    """Returns (X, y, n_matches, final_state). X/y include mirrored rows."""
+    """Returns (X, y, n_matches, final_state) with ONE row per match, in date order."""
     conn = db.get_connection()
     matches = conn.execute(
         "SELECT * FROM matches WHERE league_id=? ORDER BY match_date ASC, id ASC",
@@ -127,17 +121,20 @@ def _build_dataset(league_id):
 
     for m in matches:
         p1, p2, winner = m["player1_id"], m["player2_id"], m["winner_id"]
-        feats = _features_for(state, p1, p2)
-        label = 1 if winner == p1 else 0
-
-        X.append(feats)
-        y.append(label)
-        X.append([-f for f in feats])
-        y.append(1 - label)
-
+        X.append(_features_for(state, p1, p2))      # computed before the result is known
+        y.append(1 if winner == p1 else 0)
         _apply_result(state, p1, p2, winner, m["score1"], m["score2"])
 
-    return np.array(X), np.array(y), len(matches), state
+    return np.array(X, dtype=float).reshape(-1, len(FEATURE_NAMES)), np.array(y), len(matches), state
+
+
+def _mirror(X, y):
+    """Add each row again with the players swapped: features negated, label flipped."""
+    return np.vstack([X, -X]), np.concatenate([y, 1 - y])
+
+
+def _new_model():
+    return make_pipeline(StandardScaler(), LogisticRegression())
 
 
 def train_and_evaluate(league_id):
@@ -152,36 +149,27 @@ def train_and_evaluate(league_id):
             "n_matches": n_matches,
         }
 
-    model = LogisticRegression()
-    model.fit(X, y)
+    X_all, y_all = _mirror(X, y)
+    model = _new_model().fit(X_all, y_all)
 
-    metrics = {"n_matches": n_matches, "n_samples": len(y)}
-    train_preds = model.predict(X)
-    metrics["train_accuracy"] = float(accuracy_score(y, train_preds))
-    metrics["coefficients"] = dict(zip(FEATURE_NAMES, model.coef_[0].tolist()))
+    metrics = {"n_matches": n_matches, "n_samples": len(y_all)}
+    metrics["train_accuracy"] = float(accuracy_score(y_all, model.predict(X_all)))
+    # Weights are per standard deviation of each feature, so they are comparable.
+    metrics["coefficients"] = dict(zip(FEATURE_NAMES, model[-1].coef_[0].tolist()))
 
     if n_matches >= MIN_MATCHES_FOR_CV:
         n_splits = max(2, min(5, n_matches // 4))
-        tscv = TimeSeriesSplit(n_splits=n_splits)
         accs, losses = [], []
-        for train_idx, test_idx in tscv.split(X):
-            if len(set(y[train_idx])) < 2:
-                continue
-            m = LogisticRegression().fit(X[train_idx], y[train_idx])
-            preds = m.predict(X[test_idx])
-            probs = m.predict_proba(X[test_idx])[:, 1]
-            accs.append(accuracy_score(y[test_idx], preds))
-            try:
-                losses.append(log_loss(y[test_idx], probs, labels=[0, 1]))
-            except Exception:
-                pass
-        if accs:
-            metrics["cv_accuracy"] = float(np.mean(accs))
-            metrics["cv_log_loss"] = float(np.mean(losses)) if losses else None
-            metrics["cv_folds"] = len(accs)
-        else:
-            metrics["cv_accuracy"] = None
-            metrics["note"] = "Cross-validation folds didn't have both outcomes present; add more matches."
+        # Split by match (one row each), then mirror only the training part.
+        for train_idx, test_idx in TimeSeriesSplit(n_splits=n_splits).split(X):
+            X_tr, y_tr = _mirror(X[train_idx], y[train_idx])
+            fold_model = _new_model().fit(X_tr, y_tr)
+            accs.append(accuracy_score(y[test_idx], fold_model.predict(X[test_idx])))
+            probs = fold_model.predict_proba(X[test_idx])[:, 1]
+            losses.append(log_loss(y[test_idx], probs, labels=[0, 1]))
+        metrics["cv_accuracy"] = float(np.mean(accs))
+        metrics["cv_log_loss"] = float(np.mean(losses))
+        metrics["cv_folds"] = len(accs)
     else:
         metrics["cv_accuracy"] = None
         metrics["note"] = (
@@ -193,9 +181,12 @@ def train_and_evaluate(league_id):
     return {"model": model, "metrics": metrics}
 
 
-def predict_with_model(league_id, player1_id, player2_id):
-    """Returns (prob_player1_wins, error_message). Exactly one will be None."""
-    result = train_and_evaluate(league_id)
+def predict_with_model(league_id, player1_id, player2_id, trained=None):
+    """Returns (prob_player1_wins, error_message). Exactly one will be None.
+
+    Pass the result of train_and_evaluate() as `trained` to avoid retraining.
+    """
+    result = trained if trained is not None else train_and_evaluate(league_id)
     if "error" in result:
         return None, result["error"]
 

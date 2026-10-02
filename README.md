@@ -1,137 +1,77 @@
-# 🏓 Table Tennis Tournament Tracker
+# 🏓 Dorm Games Scoreboard
 
-A self-hosted league tracker for a 4-player table tennis tournament: automatic
-standings (MP/W/L/GF/GA/GD/Points), a live head-to-head matrix, and an Elo
-rating system with a win-probability predictor — all recomputed automatically
-from raw match results, nothing hardcoded.
+A table tennis league tracker for my dorm, built with Streamlit. Log a game, and the standings (MP/W/L/GF/GA/GD/Points), head-to-head matrix, Elo ratings and win predictions all update from the raw match results.
 
-## Why this exists
+## Why I built it
 
-The original tracking was a manually-updated Excel sheet — every match meant
-retyping totals by hand across three tables. This rebuilds it as a proper
-small data application: one source-of-truth database, one form to enter a
-result, everything else derived.
+We tracked our 4-player league in an Excel sheet. Every game meant retyping totals by hand across three tables, and they kept drifting out of sync. This app keeps one source of truth, the match log, and derives everything else from it.
 
-## Multiple leagues
+## Features
 
-The app supports more than just the original 4 players. From the sidebar you
-can:
-- **Create a new league** — a completely separate set of players, matches,
-  standings, H2H, and Elo ratings. Your original 60-game data lives in the
-  "Original Squad" league and is untouched by any league you create.
-- **Add a player to the active league** — new players start at 0 MP/W/L and
-  Elo 1500, and immediately appear in the match-entry dropdowns for that
-  league.
+- **Standings and head-to-head**, recomputed from the match log every time they're shown, so they can't drift from the games played.
+- **Elo ratings** (start 1500, K = 32) and an Elo-based win probability.
+- **A trained win predictor** (logistic regression) alongside Elo, with time-series cross-validation.
+- **Multiple private leagues** with accounts: each league is visible only to its members, and owners invite others by username.
+- **Undo a wrong entry** by deleting it from the match log (Elo is rebuilt automatically).
+- **Persistent storage** on a hosted Turso (libSQL) database, or a local SQLite file.
 
-Everything (`standings`, `H2H`, `Elo`, `match log`) is always scoped to
-whichever league is selected at the top of the sidebar.
+## How it works
 
-## The trained model (not just Elo)
+### Data model
 
-Elo (in `db.py`) is a hand-written update rule — useful, but not a learned
-model. `ml.py` adds a real supervised learning pipeline on top of the same
-match data:
+| Table | Holds |
+| --- | --- |
+| `users` | accounts (username, salted password hash) |
+| `leagues` | one row per league |
+| `league_members` | which users belong to which league, and who owns it |
+| `players` | players, unique by name within a league |
+| `baseline`, `baseline_h2h` | season totals and head-to-head wins from the original spreadsheet, kept as a fixed starting point |
+| `matches` | one row per game: date, players, scores, winner |
+| `elo` | current Elo rating per player |
 
-- **Features**, computed using only information available *before* each
-  match (no lookahead): Elo gap, each player's win rate over their last 5
-  games, their head-to-head win rate against this specific opponent so far,
-  and their recent average point margin. Every match also contributes a
-  mirrored row (players swapped, features negated, label flipped) so the
-  model can't learn a spurious "player 1 wins more" bias from column order.
-- **Model**: logistic regression (`scikit-learn`), retrained on the fly from
-  current match data each time it's used — the dataset is small enough that
-  this is cheap, and it means the model is always up to date.
-- **Evaluation**: with 10+ matches, uses `TimeSeriesSplit` cross-validation
-  — each fold is only tested on matches that happened *after* its training
-  data, so the reported accuracy/log-loss can't be inflated by leakage. With
-  fewer than 10 matches, the app says so explicitly and shows training-set
-  fit only, rather than presenting an unreliable number with false
-  confidence.
-- **Minimum data**: needs 6+ matches logged in a league before it will train
-  at all; below that, `ml.py` returns a clear error instead of a garbage
-  prediction.
+Standings are never stored. `get_standings()` adds the baseline to an aggregate over `matches` each time it's called; the head-to-head matrix works the same way.
 
-Like the Elo backfill decision, this only trains on matches entered through
-this app (the `matches` table) — the legacy 60-game baseline is
-aggregate-only, so there's no per-game data to learn from there.
+### Elo
 
-## Accounts & access control
+Each game moves both ratings by K × (actual − expected), where expected = 1 / (1 + 10^((R_opponent − R_player) / 400)). Because Elo depends on the order of games, ratings are rebuilt by replaying all of a league's matches in date order after every insert or delete. That keeps them correct even if a game is logged late with an earlier date.
 
-The app is gated behind sign-up/login (username + password, salted and
-hashed with PBKDF2-HMAC-SHA256 — no external auth service, just Python's
-stdlib). This is what stops a random person with the URL from creating fake
-matches in your league:
+The original season (60 games per player, 120 games in total) only exists as totals, not as an ordered list of games, so Elo isn't back-filled from it. Ratings start from the first game logged in the app.
 
-- **Leagues are private by default.** The league picker only ever shows
-  leagues you're a member of. Someone else's league simply doesn't appear
-  in your list — there's no way to select or edit it.
-- **Anyone can sign up and create their own league(s)**, which they own.
-- **Owners invite members by username** (sidebar → Members), so a league
-  can be shared with specific people without opening it to everyone.
-- **Bootstrapping your existing data:** since your original league(s) were
-  created before accounts existed, they start with zero members. The very
-  first account created on a given database automatically becomes owner of
-  every such "orphaned" league. **Sign up as yourself before sharing the
-  app with anyone else** — otherwise someone else's signup could claim your
-  data instead.
+**Points:** 2 for a win, 0 for a loss (table tennis has no draws).
 
-If you already deployed before this update, see "Upgrading an existing
-deployment" below for the one extra step needed.
+### The trained model
 
-## Upgrading an existing deployment
+`ml.py` trains a logistic regression on each league's own match history:
 
-- **Local database, pre multi-league** (the very first version you ran):
-  run `python upgrade_local_schema.py` once.
-- **Local or Turso database, multi-league but pre-auth** (anything from
-  before this update): nothing extra needed for local — just run the app,
-  since `db.init_db()` adds the new `users`/`league_members` tables
-  automatically (they use `CREATE TABLE IF NOT EXISTS`, so nothing existing
-  is touched). For an **already-migrated Turso database**, run
-  `python add_auth_tables_to_turso.py` once instead.
-- Either way, **sign up as yourself first** so you automatically become
-  owner of your existing league(s) — see above.
+- **Features**, computed only from games before the one being predicted: Elo difference, recent form (win rate over the last 5 games), head-to-head record, and recent average point margin.
+- **Mirrored rows:** each game is also added with the players swapped, so the model can't learn that whoever is entered as "player 1" tends to win.
+- **Scaling:** features are standardised inside a pipeline, so the learned weights are comparable.
+- **Evaluation:** with 10+ games, `TimeSeriesSplit` cross-validation always tests on later games than it trained on. Folds are split by game and mirrored inside the training part, so a game and its mirror never land on opposite sides of a split. With fewer than 10 games the app says so and shows training fit only; below 6 it doesn't train.
+- The trained model is cached and only retrains when a game is added or deleted.
 
-## Architecture
+The model only uses games logged in the app, since the original season has no per-game data.
+
+### Accounts
+
+- Passwords are hashed with PBKDF2-HMAC-SHA256 (600,000 iterations, random salt per user) from Python's standard library, and checked with a constant-time comparison. Older hashes are upgraded automatically on the next login.
+- The league picker only shows leagues you're a member of.
+- Leagues created before accounts existed have no members. The first account created on a database becomes owner of all of them, so the original owner should sign up first on a new deployment.
+
+## Project structure
 
 ```
-tt-tracker/
-├── app.py          # Streamlit UI: login gate + 6 tabs (Entry, Standings, H2H, Elo, ML Model, Log)
-├── auth.py         # Account creation, login verification, legacy-league claiming
-├── db.py           # SQLite/Turso schema + all stats/Elo/league/membership logic
-├── ml.py           # Feature engineering + trained logistic regression model
-├── data/
-│   └── tt_tracker.db
+Dorm-Games-Scoreboard/
+├── app.py                        # Streamlit UI: login, sidebar, 6 tabs
+├── db.py                         # schema, queries, standings, H2H, Elo, Turso adapter
+├── auth.py                       # sign-up, login, password hashing
+├── ml.py                         # features, model training and evaluation
+├── migrate_to_turso.py           # copy a local SQLite database into Turso
+├── upgrade_local_schema.py       # upgrade a pre-multi-league local database
+├── add_auth_tables_to_turso.py   # add account tables to an older Turso database
+├── grant_access.py               # make a user owner of every league
+├── undo_last_match.py            # delete the most recent match from the command line
 └── requirements.txt
 ```
-
-**Data model**
-- `users` — one row per account (username + salted/hashed password).
-- `leagues` — one row per league/tournament; everything below belongs to one.
-- `league_members` — who can see/edit which league, and whether they're the
-  owner (can invite others) or a regular member.
-- `players` — scoped to a league (name unique within a league, not globally).
-- `baseline` / `baseline_h2h` — the legacy 60-game season totals from the
-  original spreadsheet, frozen as a starting point for the original league.
-  New leagues/players simply start at zero.
-- `matches` — every game entered going forward (one row per game), tagged
-  with its league.
-- `elo` — current Elo rating per player.
-
-Current standings are **never stored** as a static number — `get_standings()`
-in `db.py` recomputes MP/W/L/GF/GA/GD/Points as `baseline + aggregate(matches)`
-every time it's called. Same for the H2H matrix. This means the numbers can
-never drift out of sync with the match log, which was the core problem with
-the spreadsheet.
-
-**Why Elo starts at 1500 for everyone, not backfilled:** the original sheet
-only had aggregate win/loss totals, not the actual chronological order of the
-60 legacy games. Elo is order-dependent (who you beat and when matters), so
-backfilling it from an aggregate would just be fabricated precision dressed
-up as a real rating. Elo tracking starts cleanly from the first match logged
-in this system.
-
-**Point system:** 2 points per win, 0 for a loss (matches the original
-sheet's convention — no draws in table tennis).
 
 ## Running locally
 
@@ -140,74 +80,33 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Opens at `http://localhost:8501`. The database seeds itself automatically on
-first run with the legacy baseline totals.
+It opens at `http://localhost:8501`. On first run it creates `data/tt_tracker.db` and seeds the original league.
 
-## Deploying (free, so you can link it on a resume)
+## Deploying
 
-1. Push this folder to a public GitHub repo.
-2. Go to [share.streamlit.io](https://share.streamlit.io), sign in with
-   GitHub, "New app", point it at `app.py`.
-3. Done — you get a public URL.
+The app runs on [Streamlit Community Cloud](https://share.streamlit.io): point a new app at `app.py` in this repo.
 
-**Important:** by default this uses a local SQLite file, and Streamlit
-Cloud's filesystem resets on every restart/redeploy — so without the step
-below, any matches entered on the live app can be lost. Set up persistent
-storage (next section) before relying on the live app for real matches.
+Streamlit Cloud's filesystem resets on every restart, so a deployed app needs a hosted database. If `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` are set (in Streamlit secrets or environment variables), `db.py` uses Turso instead of the local file. A small adapter makes the Turso client look like Python's `sqlite3`, so the rest of the code doesn't change.
 
-## Persistent storage with Turso (do this for a real tournament)
+### Setting up Turso
 
-The app automatically switches from local SQLite to a hosted database the
-moment it finds Turso credentials — no code changes needed, just secrets.
-
-1. **Create a free Turso database.** Go to [turso.tech](https://turso.tech),
-   sign up, and either use their web dashboard to create a database, or
-   install their CLI and run:
-   ```bash
-   turso db create tt-tracker
-   turso db show tt-tracker --url
-   turso db tokens create tt-tracker
-   ```
-   The `--url` command gives you `TURSO_DATABASE_URL` (starts with
-   `libsql://...`); the `tokens create` command gives you `TURSO_AUTH_TOKEN`.
-
-2. **Add credentials locally.** Create `.streamlit/secrets.toml` in this
-   folder (this file is gitignored — never commit it):
+1. Create a database at [turso.tech](https://turso.tech) (or with the CLI: `turso db create tt-tracker`, `turso db show tt-tracker --url`, `turso db tokens create tt-tracker`).
+2. Put the credentials in `.streamlit/secrets.toml` (gitignored):
    ```toml
    TURSO_DATABASE_URL = "libsql://your-db-name.turso.io"
    TURSO_AUTH_TOKEN = "your-token-here"
    ```
+3. To copy existing local data across, run `python migrate_to_turso.py` once, on an empty Turso database (requires Python 3.11+).
+4. Add the same two secrets in the Streamlit Cloud app settings and redeploy.
 
-3. **Migrate your existing local matches:**
-   ```bash
-   pip install -r requirements.txt
-   python migrate_to_turso.py
-   ```
-   This copies everything from your local `data/tt_tracker.db` into Turso,
-   preserving IDs so foreign keys stay correct. Run it once, on an empty
-   Turso database only.
+### Upgrading an older database
 
-4. **Add the same secrets to Streamlit Cloud:** on your app's page, go to
-   Settings → Secrets, and paste the same two lines from step 2.
+- Local database from before multi-league support: run `python upgrade_local_schema.py` once.
+- Turso database from before accounts: run `python add_auth_tables_to_turso.py` once. Local databases get the new tables automatically.
 
-5. **Redeploy.** From then on, both your local app and the live app read and
-   write the *same* Turso database — no more local/live split, and data
-   survives restarts.
+## Limitations and next steps
 
-## Possible extensions (good "future work" bullet points)
-
-- **Password reset** — currently there's no recovery flow if someone forgets
-  their password; would need an email-based reset or an admin override.
-- **Per-action permissions** — right now any league member can add matches
-  or players; only inviting new members is owner-restricted. Could add a
-  read-only "viewer" role for people who just want to watch standings.
-- **Richer features for the trained model**: rest days between matches,
-  opponent-strength-adjusted form, series-level momentum.
-- **Try other model families**: gradient boosting (XGBoost/LightGBM) often
-  handles small tabular datasets with non-linear interactions better than
-  logistic regression — worth comparing once there's more match data.
-- **Score-margin regression**: predict expected point margin, not just
-  win/loss, using the same feature set.
-- **Auth + Google Form front end**: swap the Streamlit form for a Google
-  Form + Apps Script webhook into this same DB, so matches can be logged from
-  a phone without opening the app.
+- **No password reset** yet; `grant_access.py` is the admin fallback.
+- **Permissions are coarse:** any member can add players or delete matches; only invites are owner-only. A read-only viewer role would help.
+- **Turso writes aren't transactional:** each statement commits on its own. Because Elo is rebuilt from the match log, an interrupted write corrects itself on the next insert or delete.
+- **Model:** more features (rest days, opponent-adjusted form), comparing against gradient boosting once there's more data, and predicting point margin as well as the winner.

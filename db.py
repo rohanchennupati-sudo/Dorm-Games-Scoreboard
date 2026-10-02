@@ -216,7 +216,7 @@ def seed_if_empty():
     # name -> (nickname, mp, w, l, gf, ga), decoded from the original sheet
     players = {
         "Rohan":    ("Ronchester Utd",   60, 25, 35, 592, 625),
-        "Ganesh":   ("Bastard Munchen",  60, 33, 27, 667, 633),
+        "Ganesh":   ("Bayern Munchen",   60, 33, 27, 667, 633),
         "Saad":     ("Saadio Mane",      60, 30, 30, 615, 589),
         "Shashank": ("Ripper Rails",     60, 32, 28, 596, 568),
     }
@@ -414,26 +414,28 @@ def record_match(league_id: int, match_date: str, player1_id: int, player2_id: i
         (league_id, match_date, series_id, player1_id, player2_id, score1, score2, winner_id),
     )
 
-    # --- Elo update ---
-    r1 = cur.execute("SELECT rating FROM elo WHERE player_id=?", (player1_id,)).fetchone()["rating"]
-    r2 = cur.execute("SELECT rating FROM elo WHERE player_id=?", (player2_id,)).fetchone()["rating"]
-    exp1 = 1 / (1 + 10 ** ((r2 - r1) / 400))
-    exp2 = 1 - exp1
-    actual1 = 1.0 if winner_id == player1_id else 0.0
-    actual2 = 1.0 - actual1
-    new_r1 = r1 + K_FACTOR * (actual1 - exp1)
-    new_r2 = r2 + K_FACTOR * (actual2 - exp2)
-    cur.execute("UPDATE elo SET rating=? WHERE player_id=?", (new_r1, player1_id))
-    cur.execute("UPDATE elo SET rating=? WHERE player_id=?", (new_r2, player2_id))
-
     conn.commit()
     conn.close()
-    return {"winner_id": winner_id, "new_elo": {player1_id: new_r1, player2_id: new_r2}}
+
+    # Elo depends on match order, so rebuild it from every match in date order.
+    # This keeps ratings correct even when a match is entered with an earlier
+    # date than ones already logged.
+    new_elo = recompute_elo(league_id)
+    return {"winner_id": winner_id,
+            "new_elo": {player1_id: new_elo[player1_id], player2_id: new_elo[player2_id]}}
+
+
+def _elo_step(r1, r2, p1_won):
+    """One Elo update. Returns the two new ratings."""
+    exp1 = 1 / (1 + 10 ** ((r2 - r1) / 400))
+    actual1 = 1.0 if p1_won else 0.0
+    return (r1 + K_FACTOR * (actual1 - exp1),
+            r2 + K_FACTOR * ((1 - actual1) - (1 - exp1)))
 
 
 def recompute_elo(league_id: int):
-    """Replay every remaining match in a league, in chronological order, and
-    rebuild Elo from STARTING_ELO. Call after deleting/editing any match."""
+    """Replay every match in a league in chronological order and rebuild Elo
+    from STARTING_ELO. Called after every insert and delete."""
     conn = get_connection()
     cur = conn.cursor()
     player_ids = [r["id"] for r in cur.execute(
@@ -445,25 +447,25 @@ def recompute_elo(league_id: int):
         "SELECT * FROM matches WHERE league_id=? ORDER BY match_date ASC, id ASC", (league_id,)
     ).fetchall()
     for m in matches:
-        p1, p2, winner = m["player1_id"], m["player2_id"], m["winner_id"]
-        r1, r2 = ratings[p1], ratings[p2]
-        exp1 = 1 / (1 + 10 ** ((r2 - r1) / 400))
-        exp2 = 1 - exp1
-        actual1 = 1.0 if winner == p1 else 0.0
-        actual2 = 1.0 - actual1
-        ratings[p1] = r1 + K_FACTOR * (actual1 - exp1)
-        ratings[p2] = r2 + K_FACTOR * (actual2 - exp2)
+        p1, p2 = m["player1_id"], m["player2_id"]
+        ratings[p1], ratings[p2] = _elo_step(ratings[p1], ratings[p2], m["winner_id"] == p1)
 
     for pid, rating in ratings.items():
         cur.execute("UPDATE elo SET rating=? WHERE player_id=?", (rating, pid))
     conn.commit()
     conn.close()
+    return ratings
 
 
-def delete_match(match_id: int):
+def delete_match(match_id: int, league_id: int = None):
+    """Delete a match and rebuild Elo. If league_id is given, the match must
+    belong to that league (guards against deleting another league's match)."""
     conn = get_connection()
     cur = conn.cursor()
     row = cur.execute("SELECT league_id FROM matches WHERE id=?", (match_id,)).fetchone()
+    if row and league_id is not None and row["league_id"] != league_id:
+        conn.close()
+        raise ValueError("That match doesn't belong to this league.")
     if not row:
         conn.close()
         return
@@ -482,11 +484,12 @@ def get_standings(league_id: int):
     """Baseline + all matches in this league, combined into current stats."""
     conn = get_connection()
     players = conn.execute("SELECT * FROM players WHERE league_id=?", (league_id,)).fetchall()
-    player_ids = [p["id"] for p in players]
-    baseline = {r["player_id"]: dict(r) for r in conn.execute("SELECT * FROM baseline").fetchall()
-                if r["player_id"] in player_ids}
-    elo_rows = {r["player_id"]: r["rating"] for r in conn.execute("SELECT * FROM elo").fetchall()
-                if r["player_id"] in player_ids}
+    baseline = {r["player_id"]: dict(r) for r in conn.execute(
+        "SELECT b.* FROM baseline b JOIN players p ON p.id = b.player_id WHERE p.league_id=?",
+        (league_id,)).fetchall()}
+    elo_rows = {r["player_id"]: r["rating"] for r in conn.execute(
+        "SELECT e.* FROM elo e JOIN players p ON p.id = e.player_id WHERE p.league_id=?",
+        (league_id,)).fetchall()}
     matches = conn.execute("SELECT * FROM matches WHERE league_id=?", (league_id,)).fetchall()
     conn.close()
 
@@ -529,9 +532,10 @@ def get_h2h_matrix(league_id: int):
     players = {r["id"]: r["name"] for r in conn.execute(
         "SELECT * FROM players WHERE league_id=?", (league_id,)
     ).fetchall()}
-    player_ids = set(players.keys())
-    baseline_h2h = [r for r in conn.execute("SELECT * FROM baseline_h2h").fetchall()
-                     if r["player1_id"] in player_ids and r["player2_id"] in player_ids]
+    baseline_h2h = conn.execute(
+        """SELECT b.* FROM baseline_h2h b
+           JOIN players p ON p.id = b.player1_id
+           WHERE p.league_id=?""", (league_id,)).fetchall()
     matches = conn.execute("SELECT * FROM matches WHERE league_id=?", (league_id,)).fetchall()
     conn.close()
 

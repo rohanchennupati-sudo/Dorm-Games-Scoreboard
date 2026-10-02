@@ -7,8 +7,32 @@ import auth
 
 st.set_page_config(page_title="Table Tennis Tracker", page_icon="🏓", layout="wide")
 
-db.init_db()
-db.seed_if_empty()
+
+@st.cache_resource
+def setup_database():
+    """Create tables and seed data once per server process, not on every rerun."""
+    db.init_db()
+    db.seed_if_empty()
+
+
+@st.cache_resource(max_entries=32)
+def trained_model(league_id, last_match_id, match_count):
+    """Train once per league state. Logging or deleting a match changes the
+    last id or the count, which changes the cache key and retrains."""
+    return ml.train_and_evaluate(league_id)
+
+
+def league_version(league_id):
+    conn = db.get_connection()
+    row = conn.execute(
+        "SELECT MAX(id) AS last_id, COUNT(*) AS n FROM matches WHERE league_id=?",
+        (league_id,),
+    ).fetchone()
+    conn.close()
+    return row["last_id"], row["n"]
+
+
+setup_database()
 
 
 # =============================================================================
@@ -177,7 +201,7 @@ with tab_standings:
     df = pd.DataFrame(standings)[["name", "nickname", "mp", "w", "l", "gf", "ga", "gd", "points", "elo"]]
     df.columns = ["Player", "Team", "MP", "W", "L", "GF", "GA", "GD", "Points", "Elo"]
     df.insert(0, "Rank", range(1, len(df) + 1))
-    st.dataframe(df, hide_index=True, use_container_width=True)
+    st.dataframe(df, hide_index=True, width="stretch")
 
     c1, c2 = st.columns(2)
     with c1:
@@ -194,10 +218,10 @@ with tab_h2h:
     names = sorted(name_to_id.keys())
     matrix = pd.DataFrame("—", index=names, columns=names, dtype=object)
     for (a, b), wins in h2h.items():
-        matrix.loc[a, b] = wins[a]
-        matrix.loc[b, a] = wins[b]
+        matrix.loc[a, b] = str(wins[a])   # all strings, so the column has one type
+        matrix.loc[b, a] = str(wins[b])
     st.write("Cell = row player's wins **against** column player.")
-    st.dataframe(matrix, use_container_width=True)
+    st.dataframe(matrix, width="stretch")
 
 # -------------------------------------------------------- ELO / PREDICT TAB
 with tab_elo:
@@ -206,7 +230,7 @@ with tab_elo:
     standings = db.get_standings(league_id)
     elo_df = pd.DataFrame(standings)[["name", "elo"]].sort_values("elo", ascending=False)
     elo_df.columns = ["Player", "Elo"]
-    st.dataframe(elo_df, hide_index=True, use_container_width=True)
+    st.dataframe(elo_df, hide_index=True, width="stretch")
     st.bar_chart(elo_df.set_index("Player")["Elo"])
 
     st.divider()
@@ -230,7 +254,7 @@ with tab_ml:
         "being predicted (no lookahead)."
     )
 
-    result = ml.train_and_evaluate(league_id)
+    result = trained_model(league_id, *league_version(league_id))
     if "error" in result:
         st.info(result["error"] + " Keep logging matches — the model retrains automatically each time.")
     else:
@@ -240,17 +264,17 @@ with tab_ml:
         c1.metric("Training samples", m["n_samples"], help="2× matches — each match also contributes a mirrored row (players swapped) so the model can't learn a spurious player-order bias.")
         c2.metric("Training-set accuracy", f"{m['train_accuracy']*100:.1f}%", help="Fit on the same data it was trained on — optimistic, shown for reference only.")
         if m.get("cv_accuracy") is not None:
-            c3.metric("Cross-validated accuracy", f"{m['cv_accuracy']*100:.1f}%", help=f"Time-series cross-validation across {m['cv_folds']} folds — each fold tests only on matches that happened after its training data, so no lookahead.")
+            c3.metric("Cross-validated accuracy", f"{m['cv_accuracy']*100:.1f}%", help=f"Time-series cross-validation across {m['cv_folds']} folds — each fold tests only on matches that happened after its training data, so no lookahead. Scored on real matches only (no mirrored rows).")
             if m.get("cv_log_loss") is not None:
                 c3.metric("Cross-validated log loss", f"{m['cv_log_loss']:.3f}", help="Lower is better. 0.693 is what a coin-flip model scores.")
         else:
             st.caption(m.get("note", ""))
 
-        st.write("**Learned feature weights** (positive = favors Player 1 when higher)")
+        st.write("**Learned feature weights** (per standard deviation of each feature; positive = favours Player 1)")
         coef_df = pd.DataFrame(
             [{"Feature": k, "Weight": v} for k, v in m["coefficients"].items()]
         ).sort_values("Weight", key=abs, ascending=False)
-        st.dataframe(coef_df, hide_index=True, use_container_width=True)
+        st.dataframe(coef_df, hide_index=True, width="stretch")
 
         st.divider()
         st.subheader("Model win predictor")
@@ -259,7 +283,8 @@ with tab_ml:
             ml_pred_a = st.selectbox("Player A", options=names, key="ml_pred_a")
         with mc2:
             ml_pred_b = st.selectbox("Player B", options=[n for n in names if n != ml_pred_a], key="ml_pred_b")
-        prob, err = ml.predict_with_model(league_id, name_to_id[ml_pred_a], name_to_id[ml_pred_b])
+        prob, err = ml.predict_with_model(league_id, name_to_id[ml_pred_a], name_to_id[ml_pred_b],
+                                          trained=result)
         if err:
             st.info(err)
         else:
@@ -284,7 +309,7 @@ with tab_log:
                 )
             with c2:
                 if st.button("🗑️ Delete", key=f"del_{m['id']}"):
-                    db.delete_match(m["id"])
+                    db.delete_match(m["id"], league_id=league_id)
                     st.success("Deleted and Elo recalculated.")
                     st.rerun()
             st.divider()
