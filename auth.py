@@ -1,36 +1,52 @@
 """
-auth.py — username/password accounts, using only the Python standard
-library (hashlib's PBKDF2-HMAC-SHA256, salted per user — no external auth
-service or dependency needed for a small app like this).
+auth.py — username/password accounts using only the Python standard library
+(PBKDF2-HMAC-SHA256 with a random salt per user).
 
 Design:
 - Every league requires membership to view or edit (`db.league_members`).
-  The league picker in app.py only ever shows leagues the logged-in user
-  belongs to, so a random person with the URL can create their own account
-  and their own leagues, but can't see or touch anyone else's data unless
-  explicitly invited.
-- Bootstrap problem: leagues created before accounts existed (your original
-  60-game "Original Squad" league, and anything else you made while testing)
-  have zero members, so nobody could see them. `create_user()` handles this:
-  the FIRST account ever created on a given database is automatically made
-  owner of every currently-ownerless league. In practice, sign up as
-  yourself first — you'll get ownership of all your existing data — *then*
-  share the app with friends.
+  The league picker in app.py only shows leagues the logged-in user belongs
+  to, so anyone can create an account and their own leagues, but can't see
+  or change another league unless they are invited.
+- Bootstrap: leagues created before accounts existed have no members. The
+  first account created on a database becomes owner of every league with no
+  members. On a fresh deployment the original owner should sign up first.
+
+Password hash format:
+- New hashes are stored as "pbkdf2_sha256$<iterations>$<hex digest>", so the
+  iteration count can be raised later without breaking existing accounts.
+- Older accounts store a bare hex digest made with 200,000 iterations. They
+  still log in, and their hash is upgraded to the current format on the next
+  successful login.
 """
 
 import hashlib
+import hmac
 import os
 import binascii
 import db
 
-PBKDF2_ITERATIONS = 200_000
+PBKDF2_ITERATIONS = 600_000         # OWASP guidance for PBKDF2-HMAC-SHA256
+LEGACY_ITERATIONS = 200_000         # hashes stored before the format change
+HASH_PREFIX = "pbkdf2_sha256"
 
 
-def _hash_password(password: str, salt: bytes = None):
+def _hash_password(password: str, salt: bytes = None, iterations: int = PBKDF2_ITERATIONS):
     if salt is None:
         salt = os.urandom(16)
-    pwd_hash = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, PBKDF2_ITERATIONS)
+    pwd_hash = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations)
     return salt, pwd_hash
+
+
+def _encode_hash(pwd_hash: bytes, iterations: int = PBKDF2_ITERATIONS) -> str:
+    return f"{HASH_PREFIX}${iterations}${binascii.hexlify(pwd_hash).decode()}"
+
+
+def _decode_hash(stored: str):
+    """Return (iterations, hex digest) for both the new and the legacy format."""
+    if stored.startswith(HASH_PREFIX + "$"):
+        _, iterations, digest = stored.split("$")
+        return int(iterations), digest
+    return LEGACY_ITERATIONS, stored
 
 
 def create_user(username: str, password: str):
@@ -55,13 +71,13 @@ def create_user(username: str, password: str):
     salt, pwd_hash = _hash_password(password)
     cur.execute(
         "INSERT INTO users (username, password_hash, salt) VALUES (?,?,?)",
-        (username, binascii.hexlify(pwd_hash).decode(), binascii.hexlify(salt).decode()),
+        (username, _encode_hash(pwd_hash), binascii.hexlify(salt).decode()),
     )
     user_id = cur.lastrowid
 
     if is_first_ever_user:
-        # Claim every league that currently has no members — this is how
-        # pre-auth data (your original league) gets attached to an owner.
+        # Claim every league that currently has no members, so leagues created
+        # before accounts existed get an owner.
         orphaned = cur.execute(
             """SELECT l.id FROM leagues l
                LEFT JOIN league_members lm ON lm.league_id = l.id
@@ -85,8 +101,27 @@ def verify_user(username: str, password: str):
     conn.close()
     if not row:
         return None
+
     salt = binascii.unhexlify(row["salt"])
-    _, computed_hash = _hash_password(password, salt)
-    if binascii.hexlify(computed_hash).decode() == row["password_hash"]:
-        return (row["id"], row["username"])
-    return None
+    iterations, stored_digest = _decode_hash(row["password_hash"])
+    _, computed = _hash_password(password, salt, iterations)
+
+    # Constant-time comparison so response time doesn't leak how much matched.
+    if not hmac.compare_digest(binascii.hexlify(computed).decode(), stored_digest):
+        return None
+
+    if iterations < PBKDF2_ITERATIONS:
+        _upgrade_hash(row["id"], password)
+    return (row["id"], row["username"])
+
+
+def _upgrade_hash(user_id: int, password: str):
+    """Re-hash a correct password with the current settings and a new salt."""
+    salt, pwd_hash = _hash_password(password)
+    conn = db.get_connection()
+    conn.execute(
+        "UPDATE users SET password_hash=?, salt=? WHERE id=?",
+        (_encode_hash(pwd_hash), binascii.hexlify(salt).decode(), user_id),
+    )
+    conn.commit()
+    conn.close()
